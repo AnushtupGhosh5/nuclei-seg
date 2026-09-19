@@ -1,0 +1,39 @@
+# Datasets and generated experiment artifacts
+/data/
+/outputs/
+/.torch-cache/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Model checkpoints and large generated arrays
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.tar
+
+# Notebook, editor, and OS artifacts
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key

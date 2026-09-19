@@ -1,0 +1,6 @@
+{
+  "0": ["background", [0, 0, 0]],
+  "1": ["miscellaneous", [0, 255, 255]],
+  "2": ["lymphocyte", [255, 0, 0]],
+  "3": ["epithelial", [0, 0, 255]]
+}
