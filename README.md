@@ -1,5 +1,61 @@
 # Nuclei segmentation and classification
 
+## Mamba-UNet GLySAC research model
+
+The maintained reproduction of `notebooks/notebooka0152ac793.ipynb` lives in
+`src/nuclei_seg/mamba_unet/`. It preserves the notebook's official Mamba-UNet
+encoder, native decoder and skips, three NP/HV/type heads, seed-42 split,
+targets, losses, training schedule, watershed, metrics, and five-image test
+visualization. The upstream architecture is pinned to commit
+`2eeec299581934e05b2af0322cc3107e2605867a`; its vendored source and license are
+isolated under `mamba_unet/official/` so future model changes remain reviewable.
+
+Build and run the complete train/validation/test experiment:
+
+```bash
+./build.sh
+./run_mamba_unet.sh
+```
+
+`mamba-ssm`, its compiled selective-scan kernel, and `transformers` are baked
+into the Docker image by `./build.sh`; the launchers never install packages in
+the disposable runtime container. Run the PDE-field variant with
+`./run_pde_mamba.sh`, or validate either pipeline quickly with `--smoke-test`.
+The PDE run writes its JSON/CSV reports, 25 prediction archives, and
+`pde_test_visualizations_5.png` under `outputs/mamba_unet_pde_glysac/`, plus a
+checkpoint-free `outputs/mamba_unet_pde_glysac_results.zip`. If training has
+already completed, regenerate reports and deterministic post-processing only
+with `./run_pde_mamba.sh --export-existing`; this does not retrain the model.
+
+The default configuration is [`configs/mamba_unet_glysac.json`](configs/mamba_unet_glysac.json).
+It downloads and SHA-256-verifies the same ImageNet-1K VMamba-T epoch-292
+checkpoint used in Kaggle. Results are written to `outputs/mamba_unet_glysac/`.
+For a one-epoch pipeline check, run `./run_mamba_unet.sh --smoke-test`.
+
+### PDE-guided geometric selective-scan experiment
+
+The modular experimental implementation is described in
+[`docs/PDE_GEOMETRIC_SCAN.md`](docs/PDE_GEOMETRIC_SCAN.md). It preserves the
+vendored official VMamba `SS2D` and adds selectable Cartesian, PDE, hybrid,
+normal-only, and tangential-only scan ablations around the same GLySAC split
+and training protocol. The default is conservative hybrid mode: early blocks
+remain Cartesian, a supervised intermediate head predicts a detached coarse
+PDE guide, and zero-initialized per-channel gates add geometric scans to six
+later blocks without changing the pretrained behavior at initialization.
+
+Run the default one-epoch check or full 200-epoch experiment with:
+
+```bash
+./run_geometric_mamba.sh --scan-mode hybrid --smoke-test
+./run_geometric_mamba.sh --scan-mode hybrid
+```
+
+Every completed run exports validation/test metrics, predictions, a
+nine-panel validation visualization, 16×16 scan-order visualizations,
+permutation-stability diagnostics, a pretrained-loading report, timing, and a
+checkpoint-free result archive. Best-checkpoint selection is strictly minimum
+validation loss; test data are evaluated only after selection.
+
 This project studies simultaneous nuclear instance segmentation and type
 classification. The active baseline is the original 2015 U-Net topology:
 64/128/256/512/1024 channels, unpadded convolutions, ReLU activations, max
