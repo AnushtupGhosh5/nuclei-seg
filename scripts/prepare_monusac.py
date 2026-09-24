@@ -14,8 +14,8 @@ import scipy.io as sio
 CLASS_TO_ID = {
     "Epithelial": 1,
     "Lymphocyte": 2,
-    "Neutrophil": 3,
-    "Macrophage": 4,
+    "Macrophage": 3,
+    "Neutrophil": 4,
 }
 IGNORE_CLASS = "Ambiguous"
 

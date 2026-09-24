@@ -8,8 +8,8 @@
     "background",
     "epithelial",
     "lymphocyte",
-    "neutrophil",
-    "macrophage"
+    "macrophage",
+    "neutrophil"
   ],
   "strict_official_split": false,
   "seed": 42,

@@ -56,6 +56,24 @@ permutation-stability diagnostics, a pretrained-loading report, timing, and a
 checkpoint-free result archive. Best-checkpoint selection is strictly minimum
 validation loss; test data are evaluated only after selection.
 
+The same experiment is prepared for MoNuSAC in
+[`configs/pde_geometric_mamba_monusac.json`](configs/pde_geometric_mamba_monusac.json).
+Prepare its XML/TIFF annotations once, then run a smoke test or the full
+experiment:
+
+```bash
+./prepare_monusac.sh --overwrite
+./run_geometric_mamba_monusac.sh --smoke-test
+./run_geometric_mamba_monusac.sh
+```
+
+The preparation keeps epithelial, lymphocyte, macrophage, and neutrophil as
+classes 1–4, matching the existing MoNuSAC baseline. `Ambiguous` annotations are rasterized into an evaluation-only
+ignore map and are excluded from both ground-truth scoring and predictions;
+they are never treated as a fifth biological class. The seed-42 patient split
+and ignored-pixel count are recorded in
+`data/monusac_dataset/preparation_summary.json`.
+
 This project studies simultaneous nuclear instance segmentation and type
 classification. The active baseline is the original 2015 U-Net topology:
 64/128/256/512/1024 channels, unpadded convolutions, ReLU activations, max

@@ -84,6 +84,22 @@ check. Use a distinct `--output-dir` for repeated runs. Default full run:
 ./run_geometric_mamba.sh --scan-mode hybrid
 ```
 
+The identical pipeline can be run on MoNuSAC with its four foreground classes:
+
+```bash
+./prepare_monusac.sh --overwrite
+./run_geometric_mamba_monusac.sh --smoke-test
+./run_geometric_mamba_monusac.sh
+```
+
+Preparation converts XML/TIFF annotations to the same MAT/PNG record format,
+uses a seed-42 patient-level validation split, and writes `ignore_map` for
+`Ambiguous` test annotations. Evaluation masks those pixels in the true map,
+prediction, and metrics. Ambiguous nuclei are therefore excluded rather than
+silently assigned to one of the four MoNuSAC classes.
+The canonical MoNuSAC IDs are background 0, epithelial 1, lymphocyte 2,
+macrophage 3, and neutrophil 4.
+
 The hybrid result is
 `Y_cartesian + gate * Y_geometric`, with one learnable gate per inner channel.
 Every gate starts exactly at zero. A regression test verifies that a converted
