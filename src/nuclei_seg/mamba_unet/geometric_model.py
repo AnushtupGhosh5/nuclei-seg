@@ -31,6 +31,12 @@ class PDEGeometricMambaUNet(nn.Module):
         self.guide_detach_for_sort = bool(config.guide_detach_for_sort)
         self.num_pde_bins = int(config.num_pde_bins)
         self.pde_scan_window = int(config.pde_scan_window)
+        self.normal_scan_options = dict(
+            normal_direction_bins=config.pde_normal_direction_bins,
+            normal_ray_width=config.pde_normal_ray_width,
+            gradient_epsilon=config.pde_gradient_epsilon,
+            normal_algorithm=config.pde_normal_scan_algorithm,
+        )
         self.core = VSSM(
             patch_size=4,
             in_chans=3,
@@ -115,6 +121,7 @@ class PDEGeometricMambaUNet(nn.Module):
             scan_guide,
             num_pde_bins=self.num_pde_bins,
             window_size=self.pde_scan_window,
+            **self.normal_scan_options,
         )
         self._last_scan_cache = cache
         self._last_guide = guide.detach()

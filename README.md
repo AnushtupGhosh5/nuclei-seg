@@ -46,9 +46,12 @@ later blocks without changing the pretrained behavior at initialization.
 Run the default one-epoch check or full 200-epoch experiment with:
 
 ```bash
-./run_geometric_mamba.sh --scan-mode hybrid --smoke-test
-./run_geometric_mamba.sh --scan-mode hybrid
+./run_geometric_mamba_glysac.sh --scan-mode hybrid --smoke-test
+./run_geometric_mamba_glysac.sh --scan-mode hybrid
 ```
+
+The GLySAC launcher delegates to `run_geometric_mamba.sh` and supports the
+same arguments and `CONFIG` / `IMAGE_NAME` environment overrides.
 
 Every completed run exports validation/test metrics, predictions, a
 nine-panel validation visualization, 16×16 scan-order visualizations,

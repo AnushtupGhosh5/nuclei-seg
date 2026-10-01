@@ -8,7 +8,14 @@ from skimage.segmentation import watershed
 
 
 def make_poisson_field(instance_map: np.ndarray, iterations: int = 64) -> np.ndarray:
-    """Approximate Delta u=-1 per instance with u=0 on the instance boundary."""
+    """Jacobi approximation of Delta u=-1 on the strict four-neighbor interior.
+
+    The one-pixel inner contour (including image edges) is held exactly at zero.
+    Each non-degenerate instance is independently normalized; instances without
+    an interior have an all-zero target. This is a supervised PDE-derived target.
+    """
+    if iterations < 1:
+        raise ValueError("Poisson iterations must be positive")
     labels = np.asarray(instance_map, dtype=np.int32)
     field = np.zeros(labels.shape, dtype=np.float32)
     kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], np.float32)
@@ -22,12 +29,17 @@ def make_poisson_field(instance_map: np.ndarray, iterations: int = 64) -> np.nda
         y0, y1 = max(0, ys.min()-1), min(labels.shape[0], ys.max()+2)
         x0, x1 = max(0, xs.min()-1), min(labels.shape[1], xs.max()+2)
         local_mask = mask[y0:y1, x0:x1]
+        interior = ndi.binary_erosion(
+            local_mask, structure=ndi.generate_binary_structure(2, 1), border_value=0
+        )
+        if not interior.any():
+            continue
         u = np.zeros(local_mask.shape, dtype=np.float32)
         for _ in range(iterations):
             neighbours = cv2.filter2D(
                 u, -1, kernel, borderType=cv2.BORDER_CONSTANT
             )
-            u = ((neighbours + 1.0) * 0.25) * local_mask
+            u = ((neighbours + 1.0) * 0.25) * interior
         maximum = float(u.max())
         if maximum > 0:
             u /= maximum

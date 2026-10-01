@@ -261,6 +261,37 @@ def _pad_to_minimum(
     return image, instances, types
 
 
+def type_class_counts(
+    tiles, num_classes: int, basis: str
+) -> np.ndarray:
+    """Count training labels once per cached tile, before patch sampling.
+
+    Instance counts use the majority nonzero type per instance, with ties
+    resolved toward the lowest class ID. Untyped instances are excluded.
+    """
+    if basis not in {"legacy_pixel", "foreground_pixel", "instance"}:
+        raise ValueError(f"Unknown type count basis: {basis}")
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for _, instances, types, _ in tiles:
+        if basis == "legacy_pixel":
+            counts += np.bincount(types.ravel(), minlength=num_classes)[:num_classes]
+            continue
+        valid = (instances > 0) & (types > 0)
+        if not valid.any():
+            continue
+        if basis == "foreground_pixel":
+            counts += np.bincount(types[valid], minlength=num_classes)[:num_classes]
+            continue
+        ids, inverse = np.unique(instances[valid], return_inverse=True)
+        votes = np.bincount(
+            inverse * num_classes + types[valid],
+            minlength=len(ids) * num_classes,
+        ).reshape(-1, num_classes)
+        majority = votes[:, 1:].argmax(1) + 1
+        counts += np.bincount(majority, minlength=num_classes)[:num_classes]
+    return counts
+
+
 class RandomPatchDataset(Dataset):
     def __init__(
         self,

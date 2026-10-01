@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import random
+import shutil
 import time
 import zipfile
 from collections import defaultdict
@@ -30,6 +31,7 @@ from .data import (
     read_annotation,
     read_ignore_map,
     read_rgb,
+    type_class_counts,
 )
 from .engine import (
     _loss_weights,
@@ -38,7 +40,8 @@ from .engine import (
     seed_everything,
 )
 from .geometric_config import PDEGeometricConfig
-from .geometric_loss import PDEGeometricLoss
+from .geometric_checkpoint import CHECKPOINT_SELECTION, LossCheckpointTracker, should_early_stop
+from .geometric_loss import PDEGeometricLoss, foreground_type_weights
 from .geometric_model import (
     PDEGeometricMambaUNet,
     verify_geometric_output_contract,
@@ -48,7 +51,7 @@ from .metrics import MetricAccumulator
 from .model import load_official_pretraining
 from .pde_data import PDETargetDataset
 from .pde_field import make_poisson_field
-from .pde_scan import build_pde_permutations
+from .pde_scan import build_pde_permutations, scan_diagnostics
 from .postprocess import instance_type_map
 
 
@@ -96,6 +99,11 @@ def create_pde_loaders(split, config, encoding):
 
 @torch.inference_mode()
 def validation_loss(model, loader, criterion, device, amp):
+    """Arithmetic mean of actual criterion totals over fixed validation batches.
+
+    All subcomponents use the same batch averaging. ``loss`` is a compatibility
+    alias of ``total``; the scalar returned by the criterion is authoritative.
+    """
     model.eval()
     totals = defaultdict(float)
     for images, instances, types, field, _ in tqdm(
@@ -112,10 +120,16 @@ def validation_loss(model, loader, criterion, device, amp):
             loss, parts = criterion(
                 model(images), instances, types, field
             )
-        totals["loss"] += float(loss)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite validation total loss")
+        totals["total"] += float(loss)
         for key, value in parts.items():
-            totals[key] += value
-    divisor = max(len(loader), 1)
+            if key != "total":
+                totals[key] += value
+    if not len(loader):
+        raise ValueError("Validation loader must contain at least one batch")
+    totals["loss"] = totals["total"]
+    divisor = len(loader)
     return {
         key: value / divisor for key, value in totals.items()
     }
@@ -163,7 +177,13 @@ def predict_tile(model, image, config, device):
         output = model(torch.from_numpy(batch).float().to(device))
         masks = output["np"].softmax(1)[:, 1].cpu().numpy()
         fields = output["field"].sigmoid()[:, 0].cpu().numpy()
-        types = output["tp"].softmax(1).cpu().numpy()
+        if config.type_loss_foreground_only:
+            # Normalize foreground logits before overlap blending so a large,
+            # unconstrained background logit cannot suppress an entire patch.
+            foreground_types = output["tp"][:, 1:].softmax(1)
+            types = torch.cat((torch.zeros_like(foreground_types[:, :1]), foreground_types), dim=1).cpu().numpy()
+        else:
+            types = output["tp"].softmax(1).cpu().numpy()
         for index, (y, x) in enumerate(batch_coordinates):
             area = np.s_[y : y + size, x : x + size]
             mask_accumulator[area] += masks[index] * window
@@ -173,7 +193,10 @@ def predict_tile(model, image, config, device):
     normalizer = np.maximum(normalizer, 1.0e-6)
     mask_probability = mask_accumulator / normalizer
     field = field_accumulator / normalizer
-    pixel_types = (type_accumulator / normalizer).argmax(0).astype(np.uint8)
+    if config.type_loss_foreground_only:
+        pixel_types = (type_accumulator[1:] / normalizer).argmax(0).astype(np.uint8) + 1
+    else:
+        pixel_types = (type_accumulator / normalizer).argmax(0).astype(np.uint8)
     instances = mask_pde_watershed(
         mask_probability, field,
         nucleus_threshold=config.nucleus_threshold,
@@ -182,6 +205,8 @@ def predict_tile(model, image, config, device):
         min_size=config.minimum_object_size,
         smoothing_sigma=config.field_smoothing_sigma,
     )
+    if config.type_loss_foreground_only:
+        pixel_types[instances == 0] = 0
     crop = np.s_[:original_height, :original_width]
     return (
         instances[crop], pixel_types[crop],
@@ -448,13 +473,14 @@ def save_scan_debug(model, record, config, device):
     left = max(0, (image.shape[1] - size) // 2)
     patch = image[top : top + size, left : left + size]
     model(torch.from_numpy(patch.transpose(2, 0, 1)[None]).float().to(device))
-    permutations = model.last_scan_debug(16, 16)
-    normal_rank = permutations.normal_inverse[0].reshape(16, 16).cpu()
-    tangent_rank = permutations.tangent_inverse[0].reshape(16, 16).cpu()
+    height, width = model._last_guide.shape[-2:]
+    permutations = model.last_scan_debug(height, width)
+    normal_rank = permutations.normal_inverse[0].reshape(height, width).cpu()
+    tangent_rank = permutations.tangent_inverse[0].reshape(height, width).cpu()
     potential = permutations.potential[0].cpu()
     figure, axes = plt.subplots(1, 3, figsize=(13, 4))
     axes[0].imshow(potential, cmap="magma", vmin=0, vmax=1)
-    axes[0].set_title("Predicted guide (16×16)")
+    axes[0].set_title(f"Predicted guide ({height}×{width})")
     axes[1].imshow(normal_rank, cmap="turbo")
     axes[1].set_title("Normal scan rank")
     axes[2].imshow(tangent_rank, cmap="turbo")
@@ -463,7 +489,7 @@ def save_scan_debug(model, record, config, device):
         axis.set_xticks([])
         axis.set_yticks([])
     figure.tight_layout()
-    path = config.output_dir / "geometric_scan_order_16x16.png"
+    path = config.output_dir / f"geometric_scan_order_{height}x{width}.png"
     figure.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(figure)
     return path
@@ -480,6 +506,7 @@ def save_synthetic_scan_debug(config):
         torch.from_numpy(field)[None, None], 16, 16,
         num_pde_bins=config.num_pde_bins,
         window_size=config.pde_scan_window,
+        **normal_scan_options(config),
     )
     normal_rank = permutations.normal_inverse[0].reshape(16, 16)
     tangent_rank = permutations.tangent_inverse[0].reshape(16, 16)
@@ -511,50 +538,30 @@ def save_scan_diagnostics(model, config):
             "pde_ordering_constructed": False,
         }, indent=2))
         return path
-    base = model._last_scan_cache.get(16, 16)
     guidance = model._last_scan_cache.guidance
     generator = torch.Generator(device=guidance.device).manual_seed(config.seed)
     perturbed = (guidance + 1.0e-3 * torch.randn(
         guidance.shape, generator=generator,
         device=guidance.device, dtype=guidance.dtype,
     )).clamp(0, 1)
-    alternate = build_pde_permutations(
-        perturbed, 16, 16,
-        num_pde_bins=config.num_pde_bins,
-        window_size=config.pde_scan_window,
-    )
-
-    def statistics(permutation, inverse, alternate_inverse):
-        sequence = permutation[0].float()
-        y = torch.div(sequence, 16, rounding_mode="floor")
-        x = sequence.remainder(16)
-        steps = torch.sqrt((x[1:] - x[:-1]) ** 2 + (y[1:] - y[:-1]) ** 2)
-        rank_change = (
-            inverse[0].float() - alternate_inverse[0].float()
-        ).abs()
-        return {
-            "mean_consecutive_spatial_jump_tokens": float(steps.mean()),
-            "max_consecutive_spatial_jump_tokens": float(steps.max()),
-            "mean_absolute_rank_change_under_1e-3_noise": float(
-                rank_change.mean()
-            ),
-            "fraction_tokens_same_rank_under_1e-3_noise": float(
-                (rank_change == 0).float().mean()
-            ),
-        }
-
+    resolutions = set(model._last_scan_cache._cache)
+    reports = {}
+    for height, width in sorted(resolutions):
+        base = model._last_scan_cache.get(height, width)
+        alternate = build_pde_permutations(
+            perturbed, height, width,
+            num_pde_bins=config.num_pde_bins,
+            window_size=min(config.pde_scan_window, height, width),
+            **normal_scan_options(config),
+        )
+        reports[f"{height}x{width}"] = scan_diagnostics(base, alternate)
+    guide_height, guide_width = guidance.shape[-2:]
+    primary = reports.get(f"{guide_height}x{guide_width}", next(iter(reports.values())))
     report = {
-        "resolution": [16, 16],
-        "normal": statistics(
-            base.normal, base.normal_inverse, alternate.normal_inverse
-        ),
-        "tangential": statistics(
-            base.tangent, base.tangent_inverse,
-            alternate.tangent_inverse,
-        ),
+        **primary,
+        "by_resolution": reports,
         "scientific_warnings": [
-            "Normal potential sorting groups equal-potential tokens across "
-            "different nuclei and therefore is not a local streamline.",
+            "Normal window/direction/ray ordering approximates ascent; it is not streamline integration.",
             "Window-local tangential ordering can still jump between "
             "disconnected nuclei inside one window.",
             "Discrete ranks can change under small guidance perturbations; "
@@ -617,7 +624,9 @@ def _overhead_report(model, config, device):
         "permutation_cache_scope": (
             "one forward pass" if guidance_enabled else "not applicable"
         ),
-        "sorted_resolutions": ["16x16", "8x8"] if guidance_enabled else [],
+        "sorted_resolutions": sorted({
+            f"{side}x{side}" for side in guided_stage_resolutions(config).values()
+        }) if guidance_enabled else [],
         "sort_complexity": (
             "O(B*L*log(L)) once per distinct guided resolution"
             if guidance_enabled else "not applicable"
@@ -646,8 +655,91 @@ def _overhead_report(model, config, device):
     return report
 
 
+def normal_scan_options(config):
+    return dict(
+        normal_direction_bins=config.pde_normal_direction_bins,
+        normal_ray_width=config.pde_normal_ray_width,
+        gradient_epsilon=config.pde_gradient_epsilon,
+        normal_algorithm=config.pde_normal_scan_algorithm,
+    )
+
+
+def guided_stage_resolutions(config):
+    """SS2D input sizes (encoder downsampling/decoder upsampling occur last)."""
+    return {
+        stage: config.patch_size // (4 * 2 ** (
+            int(stage.split("_")[1]) if stage.startswith("encoder")
+            else 3 - int(stage.split("_")[1])
+        ))
+        for stage in config.pde_scan_stages
+    }
+
+
+def geometric_loss_weights(train_base, device, config):
+    binary_weights, legacy_weights, _ = _loss_weights(train_base, device, len(config.type_classes))
+    counts = type_class_counts(train_base.tiles, len(config.type_classes), config.type_weight_basis)
+    if config.type_weight_basis == "legacy_pixel":
+        weights = legacy_weights
+    else:
+        weights = foreground_type_weights(counts, device, config.type_loss_foreground_only)
+    return binary_weights, weights, {
+        "basis": config.type_weight_basis,
+        "counts": counts.tolist(),
+        "weights": weights.cpu().tolist(),
+        "class_names": list(config.type_classes),
+        "count_scope": "training cached tiles once, before patch sampling; validation/test excluded",
+        "instance_assignment": "majority nonzero type; lowest ID wins ties; untyped excluded",
+        "weight_formula": "inverse_sqrt_frequency_mean_all_classes" if config.type_weight_basis == "legacy_pixel" else "inverse_sqrt_count_mean_present_foreground; absent weight=1",
+    }
+
+
+def run_metadata(config, weights):
+    return {
+        **config.to_dict(),
+        "architecture": "native Mamba-UNet with NP/PDE/type heads",
+        "guidance_source": "model_prediction_detached_for_discrete_sort",
+        "ground_truth_guidance_at_inference": False,
+        "checkpoint_selection": CHECKPOINT_SELECTION,
+        "best_validation_loss": None,
+        "best_epoch": None,
+        "validation_total_reduction": "arithmetic mean of PDEGeometricLoss scalar totals across fixed validation patch batches",
+        "loss_definition": {
+            "mask": "weighted binary CE + foreground Dice",
+            "field": "foreground SmoothL1 + field_background_weight * background SmoothL1",
+            "type": "weighted CE + Dice, using the configured type loss mode",
+            "guide": "foreground SmoothL1 + field_background_weight * background SmoothL1 at guide resolution; zero without guide head",
+            "regression_beta": 0.1,
+            "total": "mask_loss_weight * mask + field_loss_weight * field + type_loss_weight * type + guide_loss_weight * guide",
+        },
+        "type_loss_mode": "foreground_CE_present_class_foreground_Dice" if config.type_loss_foreground_only else "legacy_all_pixel_CE_all_foreground_class_Dice",
+        "class_weighting": weights,
+        "guide_native_resolution": [config.patch_size // (8 * 2 ** config.guide_source_stage)] * 2,
+        "guided_stage_resolutions": guided_stage_resolutions(config),
+        "normal_scan_description": "window -> quantized gradient direction -> perpendicular ray bin -> ascending potential -> raster tie" if config.pde_normal_scan_algorithm == "local_rays" else "legacy global potential -> gradient angle -> raster tie",
+        "normal_flat_gradient_fallback": "direction toward unweighted geometric window center below pde_gradient_epsilon",
+        "normal_direction_quantization": "nearest orientation bin, circular wrap",
+        "normal_ray_quantization": "floor(perpendicular_projection / ray_width + 1e-6)",
+        "tangential_scan_description": "window -> PDE level band -> angle around window-local potential-weighted center -> raster tie",
+        "poisson_target": "four-neighbor strict interior Jacobi Delta u=-1; inner contour/outside exactly zero; per-instance max normalization; degenerate target zero",
+        "scheduler": {"name": "StepLR", "step_size": 75, "gamma": 0.1},
+    }
+
+
 def run_experiment(config: PDEGeometricConfig) -> Path:
     config.validate()
+    resume_state = None
+    tracker = LossCheckpointTracker()
+    if config.resume_checkpoint is not None:
+        resume_state = torch.load(config.resume_checkpoint, map_location="cpu", weights_only=False)
+        # Reject incompatible selection metadata before any output files change.
+        tracker = LossCheckpointTracker.restore(resume_state)
+    if config.resume_checkpoint is None and any(
+        (config.output_dir / name).exists() for name in (
+            "geometric_run_config.json", "geometric_latest_checkpoint.pth",
+            "geometric_best_checkpoint.pth",
+        )
+    ):
+        raise FileExistsError(f"Existing experiment at {config.output_dir}; use a new output directory or explicit resume")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(config.seed, config.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -689,10 +781,11 @@ def run_experiment(config: PDEGeometricConfig) -> Path:
     # Cartesian model.
     seed_everything(config.seed, config.deterministic)
 
-    binary_weights, type_weights, type_counts = _loss_weights(
-        train_base, device, len(config.type_classes)
-    )
-    print("Training type pixels:", type_counts.tolist())
+    binary_weights, type_weights, weight_metadata = geometric_loss_weights(train_base, device, config)
+    print("Training type weighting:", weight_metadata)
+    metadata = run_metadata(config, weight_metadata)
+    metadata_path = config.output_dir / "geometric_run_config.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False))
     criterion = PDEGeometricLoss(binary_weights, type_weights, config)
     pretrained, new = model.parameter_groups()
     optimizer = torch.optim.Adam(
@@ -709,17 +802,46 @@ def run_experiment(config: PDEGeometricConfig) -> Path:
     scaler = torch.amp.GradScaler(
         "cuda", enabled=config.amp and device.type == "cuda"
     )
-    start_epoch, best_val_loss, bad_validations = 0, float("inf"), 0
+    start_epoch = 0
     history: list[dict] = []
-    if config.resume_checkpoint is not None:
-        state = torch.load(
-            config.resume_checkpoint, map_location="cpu", weights_only=False
-        )
+    if resume_state is not None:
+        state = resume_state
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         start_epoch = int(state["epoch"]) + 1
-        best_val_loss = float(state.get("best_val_loss", float("inf")))
+        if "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+        history = state.get("history", [])
+        legacy_history = config.resume_checkpoint.parent / "geometric_training_history.csv"
+        if "history" not in state and legacy_history.exists():
+            previous = pd.read_csv(legacy_history)
+            history = previous[previous.epoch <= int(state["epoch"]) + 1].to_dict("records")
+        if history:
+            pd.DataFrame(history).to_csv(config.output_dir / "geometric_training_history.csv", index=False)
+        # The best model may predate a latest/diagnostic resume checkpoint.
+        # Carry it into a fresh output directory before any new training.
+        target_best = config.output_dir / "geometric_best_checkpoint.pth"
+        source_best = config.resume_checkpoint.parent / "geometric_best_checkpoint.pth"
+        if tracker.best_epoch < 0 and config.resume_checkpoint.name == "geometric_best_checkpoint.pth":
+            tracker.best_epoch = int(state["epoch"])
+        if tracker.best_epoch == int(state["epoch"]):
+            torch.save({**state, **tracker.state_dict(), "checkpoint_selection": CHECKPOINT_SELECTION}, target_best)
+        elif source_best.exists():
+            source_state = torch.load(source_best, map_location="cpu", weights_only=False)
+            source_tracker = LossCheckpointTracker.restore(source_state)
+            if source_tracker.best_val_loss != tracker.best_val_loss:
+                raise ValueError("Resume best checkpoint does not match recorded best validation loss")
+            if tracker.best_epoch < 0:
+                tracker.best_epoch = int(source_state["epoch"])
+            if tracker.best_epoch != int(source_state["epoch"]):
+                raise ValueError("Resume best checkpoint does not match recorded best epoch")
+            if source_best.resolve() != target_best.resolve():
+                shutil.copy2(source_best, target_best)
+            del source_state
+        else:
+            raise FileNotFoundError("Resume requires the previously selected geometric_best_checkpoint.pth")
+        del state, resume_state
 
     epochs = 1 if config.smoke_test else config.epochs
     eval_every = 1 if config.smoke_test else config.eval_every
@@ -783,45 +905,45 @@ def run_experiment(config: PDEGeometricConfig) -> Path:
                 f"val_metric_{key}": value
                 for key, value in val_summary.items()
             })
-            val_loss = losses["loss"]
-            if val_loss < best_val_loss:
-                best_val_loss, bad_validations = val_loss, 0
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "epoch": epoch,
-                        "best_val_loss": best_val_loss,
-                        "config": config.to_dict(),
-                    },
-                    config.output_dir / "geometric_best_checkpoint.pth",
-                )
-                print(f"New best validation loss: {best_val_loss:.6f}")
-            else:
-                bad_validations += 1
+            # Evaluation metrics above are diagnostics only. The actual total
+            # returned by PDEGeometricLoss exclusively controls selection.
+            improved = tracker.observe(float(losses["total"]), epoch)
+        else:
+            improved = False
+        row.update({
+            "best_val_loss_so_far": tracker.best_val_loss,
+            "bad_validations": tracker.bad_validations,
+        })
+        history.append(row)
+        state = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            **tracker.state_dict(),
+            "checkpoint_selection": CHECKPOINT_SELECTION,
+            "scaler": scaler.state_dict(),
+            "history": history,
+            "config": config.to_dict(),
+        }
+        if improved:
+            torch.save(state, config.output_dir / "geometric_best_checkpoint.pth")
+            print(f"New minimum validation total loss: {tracker.best_val_loss:.6f}")
         torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_val_loss": best_val_loss,
-                "config": config.to_dict(),
-            },
+            state,
             config.output_dir / "geometric_latest_checkpoint.pth",
         )
-        history.append(row)
         pd.DataFrame(history).to_csv(
             config.output_dir / "geometric_training_history.csv", index=False
         )
+        metadata.update(best_validation_loss=tracker.best_val_loss, best_epoch=tracker.best_epoch + 1)
+        metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False))
         if (
             do_evaluate
-            and config.early_stopping_patience is not None
-            and bad_validations >= config.early_stopping_patience
+            and should_early_stop(epoch + 1, tracker.bad_validations, config.early_stopping_patience, config.early_stopping_min_epoch)
         ):
             print(
-                f"Early stopping after {bad_validations} validation events"
+                f"Early stopping after {tracker.bad_validations} non-improving validation events"
             )
             break
 
@@ -845,17 +967,15 @@ def run_experiment(config: PDEGeometricConfig) -> Path:
     scan_debug = save_scan_debug(model, split.val[0], config, device)
     synthetic_scan_debug = save_synthetic_scan_debug(config)
     scan_diagnostics = save_scan_diagnostics(model, config)
-    metadata = {
-        **config.to_dict(),
-        "architecture": "native Mamba-UNet with NP/PDE/type heads",
-        "guidance_source": "model_prediction_detached_for_discrete_sort",
-        "ground_truth_guidance_at_inference": False,
-        "checkpoint_selection": "minimum_validation_loss",
+    metadata.update({
         "best_epoch": int(best["epoch"]) + 1,
-        "best_validation_loss": float(best["best_val_loss"]),
+        "best_validation_loss": float(tracker.best_val_loss),
+        "selected_checkpoint_validation_loss": next(
+            (row["val_total"] for row in best.get("history", []) if row["epoch"] == int(best["epoch"]) + 1), None
+        ),
         "validation_summary": validation_summary,
         "test_summary": test_summary,
-    }
+    })
     (config.output_dir / "geometric_run_config.json").write_text(
         json.dumps(metadata, indent=2, allow_nan=False)
     )
@@ -914,6 +1034,8 @@ def main():
             setattr(config, name, value)
     if args.smoke_test:
         config.smoke_test = True
+        if args.output_dir is None:
+            config.output_dir = config.output_dir.with_name(config.output_dir.name + "_smoke")
     output = run_experiment(config)
     print("Geometric experiment complete:", output)
 

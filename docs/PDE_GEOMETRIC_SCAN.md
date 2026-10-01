@@ -1,5 +1,11 @@
 # PDE-guided geometric selective scans
 
+This document records the **v1 baseline** at commit
+`1a4c261464288bdce5460235156ff76c9047d65e`, including historical GPU results.
+For the current checkpoint criterion, losses, Dirichlet target, local normal
+scan, and MoNuSAC guide configuration, see
+[the v2 revision audit](PDE_GEOMETRIC_MONUSAC_V2.md).
+
 This is an experimental ablation framework, not a claim that the scan is an
 exact PDE streamline method or that it improves the baseline. The pinned
 official VMamba implementation in
