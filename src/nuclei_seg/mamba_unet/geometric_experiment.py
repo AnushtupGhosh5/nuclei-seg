@@ -47,7 +47,7 @@ from .geometric_model import (
     verify_geometric_output_contract,
 )
 from .geometric_postprocess import mask_pde_watershed
-from .metrics import MetricAccumulator
+from .metrics import MetricAccumulator, write_classification_reports
 from .model import load_official_pretraining
 from .pde_data import PDETargetDataset
 from .pde_field import make_poisson_field
@@ -217,6 +217,7 @@ def predict_tile(model, image, config, device):
 def _write_metrics(
     output_dir, split_name, summary, per_image, pixel, instance, panoptic
 ):
+    write_classification_reports(output_dir, split_name, pixel, instance, "geometric_")
     per_image.to_csv(
         output_dir / f"geometric_per_image_{split_name}.csv", index=False
     )

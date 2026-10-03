@@ -31,7 +31,7 @@ from .data import (
     read_rgb,
 )
 from .loss import SmileStyleLoss, class_weights
-from .metrics import MetricAccumulator
+from .metrics import MetricAccumulator, write_classification_reports
 from .model import MambaUNetNP_HV_Type, load_official_pretraining, verify_output_contract
 from .postprocess import instance_type_map, smile_watershed
 
@@ -224,6 +224,7 @@ def evaluate(
                 nucleus_probability=nucleus_probability,
             )
     summary, per_image, pixel, instance, panoptic = accumulator.finalize()
+    write_classification_reports(config.output_dir, split_name, pixel, instance)
     per_image.to_csv(config.output_dir / f"per_image_{split_name}.csv", index=False)
     pixel.to_csv(config.output_dir / f"classwise_pixel_{split_name}.csv", index=False)
     instance.to_csv(config.output_dir / f"classwise_instance_{split_name}.csv", index=False)

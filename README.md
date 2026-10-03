@@ -53,6 +53,36 @@ Run the default one-epoch check or full 200-epoch experiment with:
 The GLySAC launcher delegates to `run_geometric_mamba.sh` and supports the
 same arguments and `CONFIG` / `IMAGE_NAME` environment overrides.
 
+Classification reports for validation and test are saved as
+`geometric_classification_pixel_<split>.csv` and
+`geometric_classification_instance_matched_<split>.csv`. Each contains the
+per-class precision, recall, F1, specificity, one-versus-rest accuracy, and
+balanced accuracy, followed by overall rows with and without background.
+Overall rows include multiclass accuracy, macro/weighted precision, recall,
+F1 and specificity, micro precision/recall/F1, and balanced accuracy (mean
+recall over classes with true support). Their plain precision, recall, F1,
+and specificity columns use macro averages. Per-class balanced accuracy is
+`(recall + specificity) / 2`. Undefined ratios are zero; classes without true
+support are excluded from macro and weighted aggregates. Accuracy without
+background measures correct predictions among true foreground samples.
+
+The matched-instance report measures type classification among centroid-matched
+nuclei. Missed and extra detections remain in the existing detection-aware
+instance and panoptic reports; specificity there has no defined true-negative
+population. Existing metric columns remain available.
+
+Completed full-image geometric results can be refreshed from saved predictions
+without training or inference using the Docker refresh launcher:
+
+```bash
+./refresh_geometric_metrics.sh
+# Or specify another completed geometric experiment:
+./refresh_geometric_metrics.sh outputs/pde_geometric_mamba_monusac_v2_hybrid
+```
+
+The launcher updates CSV/JSON reports in the selected directory. Existing ZIP
+archives retain their original contents.
+
 Every completed run exports validation/test metrics, predictions, a
 nine-panel validation visualization, 16×16 scan-order visualizations,
 permutation-stability diagnostics, a pretrained-loading report, timing, and a

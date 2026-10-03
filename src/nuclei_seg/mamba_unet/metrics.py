@@ -13,6 +13,56 @@ def safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / (denominator + 1.0e-12))
 
 
+def classification_report(confusion: np.ndarray, class_names: dict[int, str]) -> pd.DataFrame:
+    """One-vs-rest class scores followed by multiclass aggregate scores.
+
+    Balanced accuracy is mean recall over classes with true support. Per-class
+    balanced accuracy averages sensitivity and specificity. Undefined ratios
+    use zero; absent classes are excluded from macro and weighted aggregates.
+    """
+    total = int(confusion.sum())
+    rows = []
+    for class_id, name in class_names.items():
+        tp = int(confusion[class_id, class_id])
+        support = int(confusion[class_id].sum())
+        fp = int(confusion[:, class_id].sum()) - tp
+        fn = support - tp
+        tn = total - tp - fp - fn
+        recall, specificity = safe_ratio(tp, tp + fn), safe_ratio(tn, tn + fp)
+        rows.append(dict(scope="class", class_id=class_id, **{"class": name},
+                         tp=tp, fp=fp, fn=fn, tn=tn, support=support,
+                         precision=safe_ratio(tp, tp + fp), recall=recall,
+                         f1=safe_ratio(2 * tp, 2 * tp + fp + fn),
+                         specificity=specificity, accuracy=safe_ratio(tp + tn, total),
+                         balanced_accuracy=(recall + specificity) / 2))
+    classes = pd.DataFrame(rows)
+    # Foreground-only aggregates retain background errors in class denominators.
+    for scope, selected in (("overall", classes),
+                            ("overall_no_background", classes[classes.class_id > 0])):
+        supported = selected[selected.support > 0]
+        aggregate = dict(scope=scope, class_id=-1, **{"class": scope},
+                         support=int(selected.support.sum()),
+                         accuracy=safe_ratio(selected.tp.sum(), selected.support.sum()),
+                         balanced_accuracy=float(supported.recall.mean()) if len(supported) else 0.0)
+        for metric in ("precision", "recall", "f1", "specificity"):
+            aggregate["macro_" + metric] = float(supported[metric].mean()) if len(supported) else 0.0
+            aggregate[metric] = aggregate["macro_" + metric]
+            aggregate["weighted_" + metric] = safe_ratio(
+                (supported[metric] * supported.support).sum(), supported.support.sum())
+        tp, fp, fn = selected.tp.sum(), selected.fp.sum(), selected.fn.sum()
+        aggregate.update(micro_precision=safe_ratio(tp, tp + fp),
+                         micro_recall=safe_ratio(tp, tp + fn),
+                         micro_f1=safe_ratio(2 * tp, 2 * tp + fp + fn))
+        rows.append(aggregate)
+    return pd.DataFrame(rows)
+
+
+def write_classification_reports(output_dir, split_name, pixel, instance, prefix="") -> None:
+    for name, frame in (("pixel", pixel), ("instance_matched", instance)):
+        frame.attrs["classification_report"].to_csv(
+            output_dir / f"{prefix}classification_{name}_{split_name}.csv", index=False)
+
+
 def remap_label(values: np.ndarray) -> np.ndarray:
     ids = np.unique(values)
     output = np.zeros(values.shape, np.int32)
@@ -155,6 +205,7 @@ class MetricAccumulator:
         self.class_names = dict(class_names or self.default_class_names)
         self.num_classes = len(self.class_names)
         self.pixel_confusion = np.zeros((self.num_classes, self.num_classes), np.int64)
+        self.matched_type_confusion = np.zeros_like(self.pixel_confusion)
         self.instance_counts = {
             class_id: defaultdict(int) for class_id in range(1, self.num_classes)
         }
@@ -238,6 +289,7 @@ class MetricAccumulator:
         true_vector = instance_type_vector(remapped_true, true_type)
         predicted_vector = instance_type_vector(remapped_predicted, predicted_type)
         for true_id, predicted_id in zip(paired_true, paired_predicted):
+            self.matched_type_confusion[true_vector[true_id], predicted_vector[predicted_id]] += 1
             self.classification_total += 1
             self.classification_correct += int(true_vector[true_id] == predicted_vector[predicted_id])
             for class_id in range(1, self.num_classes):
@@ -271,13 +323,16 @@ class MetricAccumulator:
                     "precision": safe_ratio(tp, tp + fp),
                     "recall": safe_ratio(tp, tp + fn),
                     "f1_dice": safe_ratio(2 * tp, 2 * tp + fp + fn),
+                    "f1": safe_ratio(2 * tp, 2 * tp + fp + fn),
                     "iou": safe_ratio(tp, tp + fp + fn),
                     "specificity": safe_ratio(tn, tn + fp),
                     "one_vs_rest_accuracy": safe_ratio(tp + tn, total),
+                    "balanced_accuracy": (safe_ratio(tp, tp + fn) + safe_ratio(tn, tn + fp)) / 2,
                     "support_pixels": int(confusion[class_id, :].sum()),
                 }
             )
         pixel = pd.DataFrame(pixel_rows)
+        pixel.attrs["classification_report"] = classification_report(confusion, self.class_names)
 
         instance_rows = []
         for class_id in range(1, self.num_classes):
@@ -306,6 +361,7 @@ class MetricAccumulator:
                 }
             )
         instance = pd.DataFrame(instance_rows)
+        instance.attrs["classification_report"] = classification_report(self.matched_type_confusion, self.class_names)
 
         panoptic_rows = []
         for class_id in range(1, self.num_classes):
@@ -384,4 +440,11 @@ class MetricAccumulator:
                 "magnification": self.magnification,
             }
         )
+        for name, frame in (("pixel", pixel), ("instance_matched", instance)):
+            for row in frame.attrs["classification_report"].to_dict("records"):
+                if row["scope"].startswith("overall"):
+                    for key in ("accuracy", "balanced_accuracy", "macro_precision", "macro_recall",
+                                "macro_f1", "macro_specificity", "weighted_precision", "weighted_recall",
+                                "weighted_f1", "weighted_specificity", "micro_precision", "micro_recall", "micro_f1"):
+                        summary[f"{name}_{row['scope']}_{key}"] = float(row[key])
         return summary, per_image, pixel, instance, panoptic

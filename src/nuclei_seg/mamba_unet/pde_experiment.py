@@ -33,7 +33,7 @@ from .engine import (
     ensure_pretrained_checkpoint,
     seed_everything,
 )
-from .metrics import MetricAccumulator
+from .metrics import MetricAccumulator, write_classification_reports
 from .model import load_official_pretraining
 from .pde_field import make_poisson_field, poisson_watershed
 from .pde_model import MambaUNetPoissonType
@@ -238,6 +238,7 @@ def evaluate(model, rows, split_name, config, encoding, device, save_predictions
                 inference_seconds=np.asarray(elapsed, dtype=np.float64),
             )
     summary, per_image, pixel, instance, panoptic = accumulator.finalize()
+    write_classification_reports(config.output_dir, split_name, pixel, instance, "pde_")
     summary.update(_postprocess_metadata())
     _write_metric_artifacts(
         config.output_dir, split_name, summary,
